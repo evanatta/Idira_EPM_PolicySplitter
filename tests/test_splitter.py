@@ -8,6 +8,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -17,7 +18,7 @@ import epm_policy_splitter as s  # noqa: E402
 import synthetic as syn  # noqa: E402
 
 FIXTURES = HERE / "fixtures"
-SMALL = 10  # limit used with the small fixtures
+SMALL = 10  # cap patched in for the small fixtures (the real cap is fixed at 900)
 
 
 def load(name):
@@ -49,12 +50,18 @@ def cost(policy, sizes):
                for a in policy["Applications"])
 
 
+def small_cap():
+    """Patch the fixed cap down to SMALL so tiny fixtures exercise the splitting."""
+    return mock.patch.object(s, "MAX_DEFINITIONS", SMALL)
+
+
 class SmallFixtureTests(unittest.TestCase):
-    """mixed.epmp with --limit 10."""
+    """mixed.epmp with the cap patched to 10."""
 
     def setUp(self):
         self.data = load("mixed.epmp")
-        self.out, self.report = s.process_epmp(copy.deepcopy(self.data), SMALL)
+        with small_cap():
+            self.out, self.report = s.process_epmp(copy.deepcopy(self.data))
 
     def test_group_split_with_prefix_and_balanced(self):
         self.assertEqual(names(self.out["AppGroups"]),
@@ -137,14 +144,15 @@ class SmallFixtureTests(unittest.TestCase):
             self.assertEqual(set(p), set(orig[p["Name"].split("_", 2)[2]]))
 
     def test_include_referenced_groups(self):
-        out, report = s.process_epmp(load("mixed.epmp"), SMALL, include_referenced_groups=True)
+        with small_cap():
+            out, report = s.process_epmp(load("mixed.epmp"), include_referenced_groups=True)
         self.assertIn("Test Group Small", names(out["AppGroups"]))
         self.assertNotIn("Test Group Unused", names(out["AppGroups"]))
         self.assertEqual(report["name_collisions"], [])
 
 
 class RealSizeTests(unittest.TestCase):
-    """The examples/ input: 1,200-app group and 1,000-entry policies, default limit."""
+    """The examples/ input: 1,200-app group and 1,000-entry policies, fixed 900 cap."""
 
     @classmethod
     def setUpClass(cls):
@@ -211,15 +219,25 @@ class SplitAlgorithmTests(unittest.TestCase):
 class CliTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
+        self.cap = small_cap()
+        self.cap.start()
 
     def tearDown(self):
+        self.cap.stop()
         shutil.rmtree(self.tmp)
+
+    def test_no_limit_option(self):
+        with self.assertRaises(SystemExit) as cm:
+            run([FIXTURES / "mixed.epmp", self.tmp / "o.epmp", "--limit", 50])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertFalse((self.tmp / "o.epmp").exists())
+        self.assertEqual(s.process_epmp.__code__.co_varnames[:2], ("data", "include_referenced_groups"))
 
     def test_bom_input_and_compact_output(self):
         bom = self.tmp / "bom.epmp"
         bom.write_bytes(b"\xef\xbb\xbf" + (FIXTURES / "mixed.epmp").read_bytes())
         out = self.tmp / "o.epmp"
-        code, log = run([bom, out, "--limit", SMALL])
+        code, log = run([bom, out])
         self.assertEqual(code, 0, log)
         text = out.read_text(encoding="utf-8")
         self.assertNotIn(", ", text[:200])
@@ -228,10 +246,10 @@ class CliTests(unittest.TestCase):
     def test_refuses_existing_output(self):
         out = self.tmp / "o.epmp"
         out.write_text("keep me")
-        code, _ = run([FIXTURES / "mixed.epmp", out, "--limit", SMALL])
+        code, _ = run([FIXTURES / "mixed.epmp", out])
         self.assertEqual(code, 2)
         self.assertEqual(out.read_text(), "keep me")
-        code, _ = run([FIXTURES / "mixed.epmp", out, "--limit", SMALL, "--force"])
+        code, _ = run([FIXTURES / "mixed.epmp", out, "--force"])
         self.assertEqual(code, 0)
         self.assertIn("Policies", json.loads(out.read_text()))
 
@@ -239,13 +257,13 @@ class CliTests(unittest.TestCase):
         inp = self.tmp / "in.epmp"
         shutil.copy(FIXTURES / "mixed.epmp", inp)
         before = inp.read_text()
-        code, _ = run([inp, inp, "--limit", SMALL])
+        code, _ = run([inp, inp])
         self.assertEqual(code, 2)
         self.assertEqual(inp.read_text(), before)
 
     def test_nothing_to_split_writes_nothing(self):
         out = self.tmp / "o.epmp"
-        code, log = run([FIXTURES / "nothing_to_split.epmp", out, "--limit", SMALL])
+        code, log = run([FIXTURES / "nothing_to_split.epmp", out])
         self.assertEqual(code, 0)
         self.assertFalse(out.exists())
         self.assertIn("No output written", log)
@@ -255,7 +273,7 @@ class CliTests(unittest.TestCase):
         s.get_import_count = lambda a, c: SMALL + 5  # every entry alone is over the limit
         try:
             out = self.tmp / "o.epmp"
-            code, log = run([FIXTURES / "mixed.epmp", out, "--limit", SMALL])
+            code, log = run([FIXTURES / "mixed.epmp", out])
         finally:
             s.get_import_count = orig
         self.assertEqual(code, 1, log)
@@ -268,7 +286,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 2)
 
     def test_summary_has_checklist(self):
-        code, log = run([FIXTURES / "mixed.epmp", self.tmp / "o.epmp", "--limit", SMALL])
+        code, log = run([FIXTURES / "mixed.epmp", self.tmp / "o.epmp"])
         self.assertEqual(code, 0)
         self.assertIn("Post-import checklist", log)
         self.assertIn("Delete the original AppGroup 'Test Group Big'", log)

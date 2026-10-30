@@ -14,7 +14,7 @@ import sys
 import uuid
 from pathlib import Path
 
-DEFAULT_LIMIT = 900
+MAX_DEFINITIONS = 900  # fixed cap per policy; the importer's hard cap is 1000
 GROUP_REF_TYPE = 2
 KNOWN_POLICY_TYPES = {11: "Windows", 13: "macOS", 53: "other"}
 KNOWN_GROUP_TYPES = {14: "Windows", 16: "macOS"}
@@ -134,17 +134,17 @@ def make_policy_piece(policy, index, applications, ids):
     return piece
 
 
-def split_appgroup(ag, limit, ids):
-    """New pieces for a group with more than limit - 1 apps, else [].
+def split_appgroup(ag, ids):
+    """New pieces for a group with more than MAX_DEFINITIONS - 1 apps, else [].
 
     A policy that references a group pays 1 + group size, so a group may hold
-    at most limit - 1 apps.
+    at most MAX_DEFINITIONS - 1 apps.
     """
     apps = ag.get("Applications") or []
-    if len(apps) <= limit - 1:
+    if len(apps) <= MAX_DEFINITIONS - 1:
         return []
     pieces, idx = [], 0
-    for i, size in enumerate(even_chunk_sizes(len(apps), limit - 1), start=1):
+    for i, size in enumerate(even_chunk_sizes(len(apps), MAX_DEFINITIONS - 1), start=1):
         pieces.append(make_group_piece(ag, i, apps[idx:idx + size], ids))
         idx += size
     return pieces
@@ -202,9 +202,10 @@ def unsupported_reason(policy):
     return None
 
 
-def process_epmp(data, limit=DEFAULT_LIMIT, include_referenced_groups=False, ids=None):
+def process_epmp(data, include_referenced_groups=False, ids=None):
     """Build the split-only output document and a report. Does not mutate data."""
     ids = ids or IdFactory(data)
+    limit = MAX_DEFINITIONS
     report = {
         "limit": limit,
         "groups_split": [],         # {name, count, pieces: [(name, size)]}
@@ -234,7 +235,7 @@ def process_epmp(data, limit=DEFAULT_LIMIT, include_referenced_groups=False, ids
     # 1. Split oversized groups.
     split_groups, out_groups, split_group_ids = {}, [], set()
     for ag in groups:
-        pieces = split_appgroup(ag, limit, ids)
+        pieces = split_appgroup(ag, ids)
         if not pieces:
             continue
         split_groups[("id", str(ag.get("Id", "")).lower())] = pieces
@@ -424,17 +425,12 @@ def main(argv=None):
                     "only the new Split_N_ objects.")
     parser.add_argument("input", help="Input .epmp file (an EPM export)")
     parser.add_argument("output", nargs="?", help="Output .epmp file (default: <input>_split.epmp)")
-    parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT,
-                        help=f"Max definitions per policy (default {DEFAULT_LIMIT})")
     parser.add_argument("--include-referenced-groups", action="store_true",
                         help="Also copy existing (unsplit) groups that the output policies reference")
     parser.add_argument("--force", action="store_true",
                         help="Allow overwriting an existing output file (or the input)")
     args = parser.parse_args(argv)
 
-    if args.limit < 2:
-        print("Error: --limit must be at least 2", file=sys.stderr)
-        return EXIT_BAD_INPUT
     input_path = Path(args.input)
     if not input_path.is_file():
         print(f"Error: input file not found: {input_path}", file=sys.stderr)
@@ -462,7 +458,7 @@ def main(argv=None):
         print("Error: input JSON must be an object with Policies/AppGroups", file=sys.stderr)
         return EXIT_BAD_INPUT
 
-    out, report = process_epmp(data, args.limit, args.include_referenced_groups)
+    out, report = process_epmp(data, args.include_referenced_groups)
     print(f"Input policies:  {len(data.get('Policies') or [])}")
     print(f"Input AppGroups: {len(data.get('AppGroups') or [])}")
 
