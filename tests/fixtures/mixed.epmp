@@ -1,0 +1,195 @@
+{
+  "FakeHeader": {
+    "Note": "synthetic test data"
+  },
+  "Policies": [
+    {
+      "Id": "00000000-0000-4000-8000-000000000010",
+      "Name": "Fake Policy Big",
+      "Applications": [
+        {
+          "applicationType": 3,
+          "displayName": "fake-app-pb0.exe"
+        },
+        {
+          "applicationType": 3,
+          "displayName": "fake-app-pb1.exe"
+        },
+        {
+          "applicationType": 3,
+          "displayName": "fake-app-pb2.exe"
+        },
+        {
+          "applicationType": 3,
+          "displayName": "fake-app-pb3.exe"
+        },
+        {
+          "applicationType": 3,
+          "displayName": "fake-app-pb4.exe"
+        },
+        {
+          "applicationType": 3,
+          "displayName": "fake-app-pb5.exe"
+        },
+        {
+          "applicationType": 3,
+          "displayName": "fake-app-pb6.exe"
+        },
+        {
+          "applicationType": 3,
+          "displayName": "fake-app-pb7.exe"
+        },
+        {
+          "applicationType": 3,
+          "displayName": "fake-app-pb8.exe"
+        },
+        {
+          "applicationType": 3,
+          "displayName": "fake-app-pb9.exe"
+        },
+        {
+          "applicationType": 3,
+          "displayName": "fake-app-pb10.exe"
+        },
+        {
+          "applicationType": 2,
+          "displayName": "Fake Group Small",
+          "id": "00000000-0000-4000-8000-000000000002"
+        }
+      ],
+      "LinkedAgentPolicies": [
+        "00000000-0000-4000-8000-000000000091"
+      ]
+    },
+    {
+      "Id": "00000000-0000-4000-8000-000000000011",
+      "Name": "Fake Policy Uses Big Group",
+      "Applications": [
+        {
+          "applicationType": 2,
+          "displayName": "Fake Group Big",
+          "id": "00000000-0000-4000-8000-000000000001"
+        },
+        {
+          "applicationType": 3,
+          "displayName": "fake-app-pu0.exe"
+        }
+      ]
+    },
+    {
+      "Id": "00000000-0000-4000-8000-000000000012",
+      "Name": "Fake Policy Untouched",
+      "Applications": [
+        {
+          "applicationType": 2,
+          "displayName": "Fake Group Small",
+          "id": "00000000-0000-4000-8000-000000000002"
+        },
+        {
+          "applicationType": 3,
+          "displayName": "fake-app-pt0.exe"
+        },
+        {
+          "applicationType": 3,
+          "displayName": "fake-app-pt1.exe"
+        }
+      ]
+    }
+  ],
+  "AppGroups": [
+    {
+      "Id": "00000000-0000-4000-8000-000000000001",
+      "Name": "Fake Group Big",
+      "Applications": [
+        {
+          "applicationType": 3,
+          "displayName": "fake-app-gb0.exe"
+        },
+        {
+          "applicationType": 3,
+          "displayName": "fake-app-gb1.exe"
+        },
+        {
+          "applicationType": 3,
+          "displayName": "fake-app-gb2.exe"
+        },
+        {
+          "applicationType": 3,
+          "displayName": "fake-app-gb3.exe"
+        },
+        {
+          "applicationType": 3,
+          "displayName": "fake-app-gb4.exe"
+        },
+        {
+          "applicationType": 3,
+          "displayName": "fake-app-gb5.exe"
+        },
+        {
+          "applicationType": 3,
+          "displayName": "fake-app-gb6.exe"
+        },
+        {
+          "applicationType": 3,
+          "displayName": "fake-app-gb7.exe"
+        },
+        {
+          "applicationType": 3,
+          "displayName": "fake-app-gb8.exe"
+        },
+        {
+          "applicationType": 3,
+          "displayName": "fake-app-gb9.exe"
+        },
+        {
+          "applicationType": 3,
+          "displayName": "fake-app-gb10.exe"
+        },
+        {
+          "applicationType": 3,
+          "displayName": "fake-app-gb11.exe"
+        }
+      ],
+      "LinkedAgentPolicies": [
+        "00000000-0000-4000-8000-000000000090"
+      ]
+    },
+    {
+      "Id": "00000000-0000-4000-8000-000000000002",
+      "Name": "Fake Group Small",
+      "Applications": [
+        {
+          "applicationType": 3,
+          "displayName": "fake-app-gs0.exe"
+        },
+        {
+          "applicationType": 3,
+          "displayName": "fake-app-gs1.exe"
+        },
+        {
+          "applicationType": 3,
+          "displayName": "fake-app-gs2.exe"
+        }
+      ]
+    },
+    {
+      "Id": "00000000-0000-4000-8000-000000000003",
+      "Name": "Fake Group Unused",
+      "Applications": [
+        {
+          "applicationType": 3,
+          "displayName": "fake-app-gu0.exe"
+        },
+        {
+          "applicationType": 3,
+          "displayName": "fake-app-gu1.exe"
+        }
+      ]
+    }
+  ],
+  "FakeOtherSection": [
+    {
+      "Note": "synthetic"
+    }
+  ]
+}

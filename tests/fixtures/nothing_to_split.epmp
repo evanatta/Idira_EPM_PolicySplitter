@@ -1,0 +1,43 @@
+{
+  "Policies": [
+    {
+      "Id": "00000000-0000-4000-8000-000000000012",
+      "Name": "Fake Policy Untouched",
+      "Applications": [
+        {
+          "applicationType": 2,
+          "displayName": "Fake Group Small",
+          "id": "00000000-0000-4000-8000-000000000002"
+        },
+        {
+          "applicationType": 3,
+          "displayName": "fake-app-pt0.exe"
+        },
+        {
+          "applicationType": 3,
+          "displayName": "fake-app-pt1.exe"
+        }
+      ]
+    }
+  ],
+  "AppGroups": [
+    {
+      "Id": "00000000-0000-4000-8000-000000000002",
+      "Name": "Fake Group Small",
+      "Applications": [
+        {
+          "applicationType": 3,
+          "displayName": "fake-app-gs0.exe"
+        },
+        {
+          "applicationType": 3,
+          "displayName": "fake-app-gs1.exe"
+        },
+        {
+          "applicationType": 3,
+          "displayName": "fake-app-gs2.exe"
+        }
+      ]
+    }
+  ]
+}
