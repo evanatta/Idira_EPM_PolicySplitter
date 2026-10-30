@@ -71,6 +71,20 @@ def group_ref(g):
             "patterns": {}, "protectInstalledFiles": False, "restrictOpenSaveFileDialog": False}
 
 
+def parent_process(g, all_ancestors=True):
+    """PARENT_PROCESS pattern as it appears in exports: patterns.PARENT_PROCESS
+    on a policy's Applications entry, pointing at an AppGroup by Id and Name."""
+    return {"@type": "ParentProcess", "AllAncestors": all_ancestors,
+            "ApplicationGroupId": g["Id"], "ApplicationGroupName": g["Name"], "isEmpty": False}
+
+
+def with_parent(app, g, all_ancestors=True):
+    """Copy of an app entry that only matches when launched by an app in group g."""
+    app = dict(app, patterns=dict(app["patterns"]))
+    app["patterns"]["PARENT_PROCESS"] = parent_process(g, all_ancestors)
+    return app
+
+
 def _self_entry(pid, internal_id, policy_type):
     return [{"Id": pid, "InternalId": internal_id, "PolicyType": policy_type}]
 
@@ -149,5 +163,8 @@ def oversized_example():
         mac_block_policy(3, "Test Mac Policy Big", [mac_app(i) for i in range(1, 1001)], 90000003),
         win_policy(4, "Test Policy Small", 2,
                    [group_ref(small)] + [win_app(i) for i in range(3001, 3004)], 90000004),
+        win_policy(5, "Test Policy Parent Process", 2,
+                   [with_parent(win_app(i), big) for i in range(3101, 3104)]
+                   + [win_app(3104)], 90000005),
     ]
     return document(policies, [big, small])

@@ -16,6 +16,7 @@ from pathlib import Path
 
 MAX_DEFINITIONS = 900  # fixed cap per policy; the importer's hard cap is 1000
 GROUP_REF_TYPE = 2
+PARENT_PROCESS = "PARENT_PROCESS"
 KNOWN_POLICY_TYPES = {11: "Windows", 13: "macOS", 53: "other"}
 KNOWN_GROUP_TYPES = {14: "Windows", 16: "macOS"}
 SYNTHETIC_INTERNAL_ID_BASE = 99000000  # new InternalIds start at or above this
@@ -134,45 +135,83 @@ def make_policy_piece(policy, index, applications, ids):
     return piece
 
 
-def split_appgroup(ag, ids):
-    """New pieces for a group with more than MAX_DEFINITIONS - 1 apps, else [].
+def make_group_copy(ag, applications, ids):
+    """Single Split_1_ copy of a group whose entries were rewritten (not oversized)."""
+    return make_group_piece(ag, 1, applications, ids)
 
-    A policy that references a group pays 1 + group size, so a group may hold
-    at most MAX_DEFINITIONS - 1 apps.
+
+def lookup_pieces(replaced, group_id, group_name):
+    """Pieces of a replaced group, matched by Id, or by Name when there is no Id."""
+    if isinstance(group_id, str) and group_id:
+        return replaced.get(("id", group_id.lower()))
+    if isinstance(group_name, str) and group_name:
+        return replaced.get(("name", group_name))
+    return None
+
+
+def parent_process_pattern(entry):
+    """The PARENT_PROCESS pattern dict of an Applications entry, or None.
+
+    In exports it sits at entry["patterns"]["PARENT_PROCESS"] and points at a
+    group with ApplicationGroupId / ApplicationGroupName.
     """
-    apps = ag.get("Applications") or []
-    if len(apps) <= MAX_DEFINITIONS - 1:
-        return []
-    pieces, idx = [], 0
-    for i, size in enumerate(even_chunk_sizes(len(apps), MAX_DEFINITIONS - 1), start=1):
-        pieces.append(make_group_piece(ag, i, apps[idx:idx + size], ids))
-        idx += size
-    return pieces
+    pats = entry.get("patterns") if isinstance(entry, dict) else None
+    pp = pats.get(PARENT_PROCESS) if isinstance(pats, dict) else None
+    return pp if isinstance(pp, dict) else None
 
 
-def rewrite_group_refs(apps, split_groups):
-    """Replace each reference to a split group with one reference per piece.
+def parent_process_target(entry, replaced):
+    pp = parent_process_pattern(entry)
+    if pp is None:
+        return None
+    return lookup_pieces(replaced, pp.get("ApplicationGroupId"), pp.get("ApplicationGroupName"))
 
-    split_groups maps original group Id and original group Name -> pieces.
-    Each new reference is a copy of the original reference with id = piece Id
-    and displayName = piece Name. Returns (new_apps, changed).
+
+def rewrite_entries(apps, replaced, ids):
+    """Point an Applications list at the pieces of replaced groups.
+
+    replaced maps ("id", original group Id) and ("name", original group Name)
+    -> list of piece groups.
+    - A group reference (applicationType 2) to a replaced group becomes one
+      reference per piece (id = piece Id, displayName = piece Name).
+    - An entry whose PARENT_PROCESS pattern points at a replaced group becomes
+      one clone of the entry per piece, with ApplicationGroupId/Name set to
+      the piece. An entry holds only one PARENT_PROCESS pattern, so the entry
+      itself is cloned. The first clone keeps the entry's id, later clones
+      get a new one. Matching "parent in any piece" is the same as "parent in
+      the original group", because a policy's entries are alternatives.
+    Order and all other fields are kept. Returns (new_apps, group_refs, pp)
+    where group_refs and pp count the rewritten original entries.
     """
-    new_apps, changed = [], False
+    new_apps, n_refs, n_pp = [], 0, 0
     for entry in apps:
-        pieces = None
-        if entry.get("applicationType") == GROUP_REF_TYPE:
-            pieces = split_groups.get(("id", str(entry.get("id", "")).lower())) or \
-                split_groups.get(("name", entry.get("displayName")))
-        if not pieces:
+        if not isinstance(entry, dict):
             new_apps.append(entry)
             continue
-        changed = True
-        for piece in pieces:
-            ref = copy.deepcopy(entry)
-            ref["id"] = piece["Id"]
-            ref["displayName"] = piece["Name"]
-            new_apps.append(ref)
-    return new_apps, changed
+        if entry.get("applicationType") == GROUP_REF_TYPE:
+            pieces = lookup_pieces(replaced, entry.get("id"), entry.get("displayName"))
+            if pieces:
+                n_refs += 1
+                for piece in pieces:
+                    ref = copy.deepcopy(entry)
+                    ref["id"] = piece["Id"]
+                    ref["displayName"] = piece["Name"]
+                    new_apps.append(ref)
+                continue
+        pieces = parent_process_target(entry, replaced)
+        if pieces:
+            n_pp += 1
+            for i, piece in enumerate(pieces):
+                clone = copy.deepcopy(entry)
+                if i and "id" in clone:
+                    clone["id"] = ids.guid(entry.get("id"))
+                pp = clone["patterns"][PARENT_PROCESS]
+                pp["ApplicationGroupId"] = piece["Id"]
+                pp["ApplicationGroupName"] = piece["Name"]
+                new_apps.append(clone)
+            continue
+        new_apps.append(entry)
+    return new_apps, n_refs, n_pp
 
 
 def find_strings(obj, wanted, path=""):
@@ -211,12 +250,14 @@ def process_epmp(data, include_referenced_groups=False, ids=None):
         "groups_split": [],         # {name, count, pieces: [(name, size)]}
         "policies_split": [],       # {name, count, pieces: [(name, size)]}
         "policies_associated": [],  # {name, count, new_name}
+        "groups_associated": [],    # {name, count, new_name}: copied only to rewrite PARENT_PROCESS
+        "parent_process_rewritten": [],  # (kind, object name, entries rewritten)
         "skipped_policies": [],     # (name, reason)
         "unknown_types": [],        # (kind, name, PolicyType)
         "referenced_groups": [],
         "missing_groups": [],
         "included_groups": [],
-        "stale_group_refs": [],     # (object name, path) still pointing at a split group's Id
+        "stale_group_refs": [],     # (object name, path) still pointing at a replaced group's Id
         "emptied_sections": [],
         "name_collisions": [],
         "over_limit": [],
@@ -232,30 +273,79 @@ def process_epmp(data, include_referenced_groups=False, ids=None):
         if g.get("PolicyType") not in KNOWN_GROUP_TYPES:
             report["unknown_types"].append(("AppGroup", g.get("Name"), g.get("PolicyType")))
 
-    # 1. Split oversized groups.
-    split_groups, out_groups, split_group_ids = {}, [], set()
-    for ag in groups:
-        pieces = split_appgroup(ag, ids)
-        if not pieces:
-            continue
-        split_groups[("id", str(ag.get("Id", "")).lower())] = pieces
-        split_groups[("name", ag.get("Name"))] = pieces
-        split_group_ids.add(str(ag.get("Id", "")).lower())
+    # 1. Groups to replace: oversized ones, plus (transitively) any group with an
+    #    entry whose PARENT_PROCESS pattern points at a group being replaced.
+    def key_of(g):
+        return str(g.get("Id", "")).lower()
+
+    def pp_targets(g):
+        """Keys of groups in this file that g's PARENT_PROCESS patterns point at."""
+        found = []
+        for e in g.get("Applications") or []:
+            pp = parent_process_pattern(e)
+            if pp is None:
+                continue
+            gid, gname = pp.get("ApplicationGroupId"), pp.get("ApplicationGroupName")
+            target = groups_by_id.get(gid.lower()) if isinstance(gid, str) and gid else \
+                groups_by_name.get(gname)
+            if target is not None:
+                found.append(key_of(target))
+        return found
+
+    to_replace = {key_of(g) for g in groups
+                  if len(g.get("Applications") or []) > limit - 1}
+    grew = True
+    while grew:
+        grew = False
+        for g in groups:
+            if key_of(g) not in to_replace and any(t in to_replace for t in pp_targets(g)):
+                to_replace.add(key_of(g))
+                grew = True
+
+    # Build pieces so that a group is built after the groups it points at;
+    # a PARENT_PROCESS cycle between replaced groups cannot be resolved and is
+    # left to the stale-reference warning below.
+    replaced, out_groups, built = {}, [], set()
+    pending = [g for g in groups if key_of(g) in to_replace]
+    while pending:
+        ready = [g for g in pending
+                 if all(t in built or t == key_of(g) or t not in to_replace
+                        for t in pp_targets(g))] or pending[:1]
+        g = ready[0]
+        pending.remove(g)
+        apps, _, n_pp = rewrite_entries(g.get("Applications") or [], replaced, ids)
+        if n_pp:
+            report["parent_process_rewritten"].append(("AppGroup", g.get("Name", "Unnamed"), n_pp))
+        if len(apps) > limit - 1:
+            pieces, idx = [], 0
+            for i, size in enumerate(even_chunk_sizes(len(apps), limit - 1), start=1):
+                pieces.append(make_group_piece(g, i, apps[idx:idx + size], ids))
+                idx += size
+            report["groups_split"].append({
+                "name": g.get("Name", "Unnamed"),
+                "count": len(apps),
+                "pieces": [(p["Name"], len(p["Applications"])) for p in pieces],
+            })
+        else:
+            pieces = [make_group_copy(g, apps, ids)]
+            report["groups_associated"].append({
+                "name": g.get("Name", "Unnamed"), "count": len(apps),
+                "new_name": pieces[0]["Name"]})
+        replaced[("id", key_of(g))] = pieces
+        replaced[("name", g.get("Name"))] = pieces
+        built.add(key_of(g))
         out_groups.extend(pieces)
-        report["groups_split"].append({
-            "name": ag.get("Name", "Unnamed"),
-            "count": len(ag.get("Applications") or []),
-            "pieces": [(p["Name"], len(p["Applications"])) for p in pieces],
-        })
+    replaced_ids = set(built)
 
     # Group sizes as they will be after import: pieces replace their originals.
     orig_counts = {g.get("Name"): len(g.get("Applications") or []) for g in groups}
     ag_counts = {n: c for n, c in orig_counts.items()
-                 if ("name", n) not in split_groups}
+                 if ("name", n) not in replaced}
     for p in out_groups:
         ag_counts[p["Name"]] = len(p["Applications"])
 
-    # 2. Policies: rewrite refs to split groups, then split equally.
+    # 2. Policies: rewrite refs and PARENT_PROCESS patterns that point at
+    #    replaced groups, then split equally (clones count 1 each).
     out_policies = []
     for policy in policies:
         reason = unsupported_reason(policy)
@@ -267,7 +357,9 @@ def process_epmp(data, include_referenced_groups=False, ids=None):
             report["unknown_types"].append(("policy", policy.get("Name"), policy.get("PolicyType")))
         apps = policy["Applications"]
         orig_total = policy_count(policy, orig_counts)
-        new_apps, refs_changed = rewrite_group_refs(apps, split_groups)
+        new_apps, n_refs, n_pp = rewrite_entries(apps, replaced, ids)
+        if n_pp:
+            report["parent_process_rewritten"].append(("policy", policy.get("Name", "Unnamed"), n_pp))
         costs = [get_import_count(a, ag_counts) for a in new_apps]
         bounds = contiguous_balanced_split(costs, limit)
         if len(bounds) > 1:
@@ -279,7 +371,7 @@ def process_epmp(data, include_referenced_groups=False, ids=None):
                 "count": orig_total,
                 "pieces": [(p["Name"], policy_count(p, ag_counts)) for p in pieces],
             })
-        elif refs_changed:
+        elif n_refs or n_pp:
             piece = make_policy_piece(policy, 1, new_apps, ids)
             out_policies.append(piece)
             report["policies_associated"].append({
@@ -306,12 +398,16 @@ def process_epmp(data, include_referenced_groups=False, ids=None):
             out_groups.append(copy.deepcopy(groups_by_name[n]))
             report["included_groups"].append(n)
 
-    # 4. Other places (e.g. PARENT_PROCESS patterns) that point at a split group's Id.
-    if split_group_ids:
-        for obj in [p for p in policies if isinstance(p, dict)] + groups:
-            for path, _ in find_strings(obj, split_group_ids):
-                if not (path.startswith("Applications[") and path.endswith("].id")) and path != "Id":
-                    report["stale_group_refs"].append((obj.get("Name", "Unnamed"), path))
+    # 4. Anything that still carries a replaced group's original Id: fields the
+    #    rewrite does not know, PARENT_PROCESS cycles between replaced groups,
+    #    and skipped policies (which are not in the output).
+    if replaced_ids:
+        skipped = {n for n, _ in report["skipped_policies"]}
+        scan = out_policies + out_groups + \
+            [p for p in policies if isinstance(p, dict) and p.get("Name", "Unnamed") in skipped]
+        for obj in scan:
+            for path, _ in find_strings(obj, replaced_ids):
+                report["stale_group_refs"].append((obj.get("Name", "Unnamed"), path))
 
     # 5. Checks.
     existing_names = {g.get("Name") for g in groups} | \
@@ -353,6 +449,11 @@ def print_report(r, include_referenced_groups):
     for g in r["groups_split"]:
         print(f"  {g['name']}: {g['count']} apps -> "
               + ", ".join(f"{n} ({s})" for n, s in g["pieces"]))
+    if r["groups_associated"]:
+        print(f"Groups copied:         {len(r['groups_associated'])} "
+              f"(under the limit, but their PARENT_PROCESS patterns point at a split group)")
+        for g in r["groups_associated"]:
+            print(f"  {g['name']} -> {g['new_name']} ({g['count']} apps)")
     print(f"Policies split:        {len(r['policies_split'])}")
     for p in r["policies_split"]:
         print(f"  {p['name']}: {p['count']} defs -> "
@@ -362,9 +463,15 @@ def print_report(r, include_referenced_groups):
     for p in r["policies_associated"]:
         print(f"  {p['name']} -> {p['new_name']} ({p['count']} defs)")
     n_pol = sum(len(p["pieces"]) for p in r["policies_split"]) + len(r["policies_associated"])
-    n_grp = sum(len(g["pieces"]) for g in r["groups_split"]) + len(r["included_groups"])
+    n_grp = sum(len(g["pieces"]) for g in r["groups_split"]) + \
+        len(r["groups_associated"]) + len(r["included_groups"])
     print(f"Policies in output:    {n_pol}")
     print(f"AppGroups in output:   {n_grp}")
+    if r["parent_process_rewritten"]:
+        print("PARENT_PROCESS patterns pointing at a split group were rewritten "
+              "(one entry per piece):")
+        for kind, n, k in r["parent_process_rewritten"]:
+            print(f"  {kind} {n}: {k} entr{'y' if k == 1 else 'ies'}")
     if r["emptied_sections"]:
         print(f"Other sections left empty in output: {', '.join(r['emptied_sections'])}")
 
@@ -387,8 +494,8 @@ def print_report(r, include_referenced_groups):
         for n in r["missing_groups"]:
             print(f"  {n}")
     if r["stale_group_refs"]:
-        print("\nWARNING: these fields still point at the Id of a group that was split "
-              "(not rewritten; fix by hand after import):")
+        print("\nWARNING: these fields still point at the Id of a group that is replaced by "
+              "Split_N_ pieces and could not be rewritten; fix by hand after import:")
         for n, path in r["stale_group_refs"]:
             print(f"  {n}: {path}")
     if r["name_collisions"]:
@@ -410,7 +517,7 @@ def print_checklist(r):
     lines = ["Import the output file. It adds only new Split_N_ objects (new names and Ids)."]
     for p in r["policies_split"] + r["policies_associated"]:
         lines.append(f"Delete the original policy '{p['name']}' (replaced by its Split_N_ copies).")
-    for g in r["groups_split"]:
+    for g in r["groups_split"] + r["groups_associated"]:
         lines.append(f"Delete the original AppGroup '{g['name']}' (replaced by its Split_N_ copies).")
     lines.append("Check targets/assignments, active state and priority of the Split_N_ policies "
                  "against the originals before deleting them.")
