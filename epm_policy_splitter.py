@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Split EPM policy exports so no policy exceeds the importer definition limit.
+"""Split Idira EPM policy exports so no policy exceeds the importer definition limit.
 
-The output .epmp contains ONLY the objects created by the split (new AppGroup
-pieces and new policies), so the import adds just those. Everything that did
-not need splitting stays in the tenant untouched. See README.md.
+Input: an .epmp export (JSON). Output: an .epmp that contains ONLY the split
+objects: new policies and AppGroups named Split_1_<name>, Split_2_<name>, ...
+Everything that did not need splitting stays in the tenant untouched; the
+originals that were split are deleted by the admin after import. See README.md.
 """
 
 import argparse
@@ -15,10 +16,17 @@ from pathlib import Path
 
 DEFAULT_LIMIT = 900
 GROUP_REF_TYPE = 2
+KNOWN_POLICY_TYPES = {11: "Windows", 13: "macOS", 53: "other"}
+KNOWN_GROUP_TYPES = {14: "Windows", 16: "macOS"}
+SYNTHETIC_INTERNAL_ID_BASE = 99000000  # new InternalIds start at or above this
 
 EXIT_OK = 0
 EXIT_OVER_LIMIT = 1
 EXIT_BAD_INPUT = 2
+
+
+def split_name(index, name):
+    return f"Split_{index}_{name}"
 
 
 def get_import_count(app_entry, ag_counts):
@@ -33,53 +41,111 @@ def policy_count(policy, ag_counts):
 
 
 def even_chunk_sizes(total, max_size):
+    """ceil(total / max_size) sizes that differ by at most 1."""
     if total <= max_size:
         return [total]
     num_chunks = (total + max_size - 1) // max_size
-    base = total // num_chunks
-    extra = total % num_chunks
+    base, extra = divmod(total, num_chunks)
     return [base + 1 if i < extra else base for i in range(num_chunks)]
 
 
-def new_id_like(old_id):
-    """A fresh UUID formatted like the original Id (upper case / braces)."""
-    new = str(uuid.uuid4())
-    if isinstance(old_id, str):
-        if old_id.upper() == old_id and any(c.isalpha() for c in old_id):
-            new = new.upper()
-        if old_id.startswith("{") and old_id.endswith("}"):
-            new = "{" + new + "}"
-    return new
+def contiguous_balanced_split(costs, limit):
+    """Cut a list of entry costs into contiguous, order-preserving pieces.
 
-
-def make_piece(obj, index, applications):
-    """Copy of a policy/group as a NEW object: Name_<index>, new Id, given apps.
-
-    LinkedAgentPolicies is cleared (if present) because the links belong to the
-    original object; the summary tells the admin to re-link.
+    Uses ceil(total / limit) pieces when possible (more only if heavy entries
+    make that impossible). Each piece aims at an equal share of the remaining
+    cost and never exceeds the limit unless a single entry alone does.
+    Returns a list of (start, end) index pairs.
     """
-    piece = copy.deepcopy(obj)
-    piece["Name"] = f"{obj.get('Name', 'Unnamed')}_{index}"
-    piece["Id"] = new_id_like(obj.get("Id"))
+    total = sum(costs)
+    if total <= limit:
+        return [(0, len(costs))]
+    k = (total + limit - 1) // limit
+    while True:
+        bounds, start, remaining = [], 0, total
+        for piece in range(k):
+            left = k - piece
+            if left == 1:
+                end = len(costs)
+            else:
+                target = (remaining + left - 1) // left
+                end, cur = start, 0
+                while end < len(costs):
+                    nxt = cur + costs[end]
+                    if cur and (nxt > limit or abs(nxt - target) > abs(cur - target)):
+                        break
+                    cur = nxt
+                    end += 1
+                    if cur >= target:
+                        break
+            bounds.append((start, end))
+            remaining -= sum(costs[start:end])
+            start = end
+        fits = all(sum(costs[s:e]) <= limit or e - s == 1 for s, e in bounds)
+        if (fits and start == len(costs)) or k >= len(costs):
+            return [(s, e) for s, e in bounds if e > s]
+        k += 1
+
+
+class IdFactory:
+    """New GUIDs and synthetic, unique InternalIds for the self-entries."""
+
+    def __init__(self, data):
+        existing = [0]
+        for p in data.get("Policies") or []:
+            for link in (p.get("LinkedAgentPolicies") or []) if isinstance(p, dict) else []:
+                if isinstance(link, dict) and isinstance(link.get("InternalId"), int):
+                    existing.append(link["InternalId"])
+        self.next_internal = max(max(existing) + 1, SYNTHETIC_INTERNAL_ID_BASE)
+
+    @staticmethod
+    def guid(like=None):
+        new = str(uuid.uuid4())
+        if isinstance(like, str) and like.upper() == like and any(c.isalpha() for c in like):
+            new = new.upper()
+        return new
+
+    def internal_id(self):
+        value = self.next_internal
+        self.next_internal += 1
+        return value
+
+
+def make_group_piece(ag, index, applications, ids):
+    piece = copy.deepcopy(ag)  # keeps every field, incl. LinkedAgentPolicies as-is
+    piece["Id"] = ids.guid(ag.get("Id"))
+    piece["Name"] = split_name(index, ag.get("Name", "Unnamed"))
     piece["Applications"] = applications
-    if "LinkedAgentPolicies" in piece:
-        piece["LinkedAgentPolicies"] = []
     return piece
 
 
-def split_appgroup(ag, limit):
-    """Return the new pieces for an oversized group, or [] if it fits.
+def make_policy_piece(policy, index, applications, ids):
+    """Deep copy with new Id, prefixed Name, and a fresh LinkedAgentPolicies self-entry."""
+    piece = copy.deepcopy(policy)
+    piece["Id"] = ids.guid(policy.get("Id"))
+    piece["Name"] = split_name(index, policy.get("Name", "Unnamed"))
+    piece["Applications"] = applications
+    links = policy.get("LinkedAgentPolicies")
+    if isinstance(links, list) and links and isinstance(links[0], dict):
+        entry = copy.deepcopy(links[0])
+        entry["Id"] = piece["Id"]
+        entry["InternalId"] = ids.internal_id()
+        piece["LinkedAgentPolicies"] = [entry]
+    return piece
 
-    A group may hold at most limit - 1 apps, because a policy that references
-    it costs 1 + group size.
+
+def split_appgroup(ag, limit, ids):
+    """New pieces for a group with more than limit - 1 apps, else [].
+
+    A policy that references a group pays 1 + group size, so a group may hold
+    at most limit - 1 apps.
     """
     apps = ag.get("Applications") or []
     if len(apps) <= limit - 1:
         return []
-    pieces = []
-    idx = 0
+    pieces, idx = [], 0
     for i, size in enumerate(even_chunk_sizes(len(apps), limit - 1), start=1):
-        pieces.append(make_piece(ag, i, apps[idx:idx + size]))
+        pieces.append(make_group_piece(ag, i, apps[idx:idx + size], ids))
         idx += size
     return pieces
 
@@ -87,130 +153,138 @@ def split_appgroup(ag, limit):
 def rewrite_group_refs(apps, split_groups):
     """Replace each reference to a split group with one reference per piece.
 
-    split_groups: {original name: (original Id, [pieces])}.
-    ID handling: any field of the reference that held the original group's Id
-    is set to the piece's Id. If the reference has its own `id` that is not the
-    group Id, the first piece keeps it and later pieces get fresh ids.
-    Returns (new_apps, changed).
+    split_groups maps original group Id and original group Name -> pieces.
+    Each new reference is a copy of the original reference with id = piece Id
+    and displayName = piece Name. Returns (new_apps, changed).
     """
-    new_apps = []
-    changed = False
+    new_apps, changed = [], False
     for entry in apps:
-        name = entry.get("displayName")
-        if entry.get("applicationType") != GROUP_REF_TYPE or name not in split_groups:
+        pieces = None
+        if entry.get("applicationType") == GROUP_REF_TYPE:
+            pieces = split_groups.get(("id", str(entry.get("id", "")).lower())) or \
+                split_groups.get(("name", entry.get("displayName")))
+        if not pieces:
             new_apps.append(entry)
             continue
         changed = True
-        orig_id, pieces = split_groups[name]
-        for i, piece in enumerate(pieces):
+        for piece in pieces:
             ref = copy.deepcopy(entry)
+            ref["id"] = piece["Id"]
             ref["displayName"] = piece["Name"]
-            matched = False
-            if isinstance(orig_id, str) and orig_id:
-                for key, value in list(ref.items()):
-                    if key != "displayName" and isinstance(value, str) and value.lower() == orig_id.lower():
-                        ref[key] = piece["Id"]
-                        matched = True
-            if not matched and "id" in ref and i > 0:
-                ref["id"] = new_id_like(ref["id"])
             new_apps.append(ref)
     return new_apps, changed
 
 
-def even_split_entries(apps, ag_counts, limit):
-    costs = [get_import_count(a, ag_counts) for a in apps]
-    total = sum(costs)
-    if total <= limit:
-        return [apps]
-    num_chunks = (total + limit - 1) // limit
-    chunks = [[] for _ in range(num_chunks)]
-    chunk_costs = [0] * num_chunks
-    for entry, cost in zip(apps, costs):
-        best_idx = None
-        best_key = None
-        for i in range(len(chunks)):
-            if chunk_costs[i] + cost <= limit:
-                key = (chunk_costs[i], i)
-                if best_key is None or key < best_key:
-                    best_key = key
-                    best_idx = i
-        if best_idx is None:
-            chunks.append([entry])
-            chunk_costs.append(cost)
-        else:
-            chunks[best_idx].append(entry)
-            chunk_costs[best_idx] += cost
-    return [c for c in chunks if c]
+def find_strings(obj, wanted, path=""):
+    """Yield (path, value) for every string in obj whose lower-case is in wanted."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            yield from find_strings(v, wanted, f"{path}.{k}" if path else k)
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            yield from find_strings(v, wanted, f"{path}[{i}]")
+    elif isinstance(obj, str) and obj.lower() in wanted:
+        yield path, obj
 
 
-def process_epmp(data, limit=DEFAULT_LIMIT, include_referenced_groups=False):
+def unsupported_reason(policy):
+    if not isinstance(policy, dict):
+        return "not a JSON object"
+    if "Applications" not in policy:
+        return "no Applications key"
+    apps = policy["Applications"]
+    if apps is None:
+        return "Applications is null"
+    if not isinstance(apps, list):
+        return "Applications is not a list"
+    if any(not isinstance(a, dict) for a in apps):
+        return "Applications has non-object entries"
+    return None
+
+
+def process_epmp(data, limit=DEFAULT_LIMIT, include_referenced_groups=False, ids=None):
     """Build the split-only output document and a report. Does not mutate data."""
+    ids = ids or IdFactory(data)
     report = {
         "limit": limit,
-        "groups_split": [],         # {name, count, pieces: [(name, size)], had_links}
-        "policies_split": [],       # {name, count, pieces: [(name, size)], had_links}
-        "policies_associated": [],  # {name, count, new_name, had_links}
-        "referenced_groups": [],    # existing (unsplit) group names the output references
-        "missing_groups": [],       # group names referenced but not found in AppGroups
-        "included_groups": [],      # unsplit groups copied in (flag)
-        "emptied_sections": [],     # other top-level lists emptied in the output
-        "name_collisions": [],      # new names that already exist in the input
-        "over_limit": [],           # (name, count) still over the limit
+        "groups_split": [],         # {name, count, pieces: [(name, size)]}
+        "policies_split": [],       # {name, count, pieces: [(name, size)]}
+        "policies_associated": [],  # {name, count, new_name}
+        "skipped_policies": [],     # (name, reason)
+        "unknown_types": [],        # (kind, name, PolicyType)
+        "referenced_groups": [],
+        "missing_groups": [],
+        "included_groups": [],
+        "stale_group_refs": [],     # (object name, path) still pointing at a split group's Id
+        "emptied_sections": [],
+        "name_collisions": [],
+        "over_limit": [],
         "max_count": 0,
     }
 
-    groups = data.get("AppGroups") or []
+    groups = [g for g in (data.get("AppGroups") or []) if isinstance(g, dict)]
     policies = data.get("Policies") or []
     groups_by_name = {g.get("Name"): g for g in groups}
+    groups_by_id = {str(g.get("Id", "")).lower(): g for g in groups}
+
+    for g in groups:
+        if g.get("PolicyType") not in KNOWN_GROUP_TYPES:
+            report["unknown_types"].append(("AppGroup", g.get("Name"), g.get("PolicyType")))
 
     # 1. Split oversized groups.
-    split_groups = {}
-    out_groups = []
+    split_groups, out_groups, split_group_ids = {}, [], set()
     for ag in groups:
-        pieces = split_appgroup(ag, limit)
+        pieces = split_appgroup(ag, limit, ids)
         if not pieces:
             continue
-        split_groups[ag.get("Name")] = (ag.get("Id"), pieces)
+        split_groups[("id", str(ag.get("Id", "")).lower())] = pieces
+        split_groups[("name", ag.get("Name"))] = pieces
+        split_group_ids.add(str(ag.get("Id", "")).lower())
         out_groups.extend(pieces)
         report["groups_split"].append({
             "name": ag.get("Name", "Unnamed"),
             "count": len(ag.get("Applications") or []),
             "pieces": [(p["Name"], len(p["Applications"])) for p in pieces],
-            "had_links": bool(ag.get("LinkedAgentPolicies")),
         })
 
-    # Sizes as they will be after import: pieces replace their originals.
-    ag_counts = {g.get("Name"): len(g.get("Applications") or []) for g in groups
-                 if g.get("Name") not in split_groups}
-    for _, pieces in split_groups.values():
-        for p in pieces:
-            ag_counts[p["Name"]] = len(p["Applications"])
+    # Group sizes as they will be after import: pieces replace their originals.
+    orig_counts = {g.get("Name"): len(g.get("Applications") or []) for g in groups}
+    ag_counts = {n: c for n, c in orig_counts.items()
+                 if ("name", n) not in split_groups}
+    for p in out_groups:
+        ag_counts[p["Name"]] = len(p["Applications"])
 
-    # 2. Policies: rewrite refs, then split. Keep only policies that changed.
+    # 2. Policies: rewrite refs to split groups, then split equally.
     out_policies = []
     for policy in policies:
-        apps = policy.get("Applications") or []
-        orig_total = policy_count(policy, {**ag_counts, **{
-            n: len(groups_by_name[n].get("Applications") or []) for n in split_groups}})
+        reason = unsupported_reason(policy)
+        if reason:
+            name = policy.get("Name", "Unnamed") if isinstance(policy, dict) else "?"
+            report["skipped_policies"].append((name, reason))
+            continue
+        if policy.get("PolicyType") not in KNOWN_POLICY_TYPES:
+            report["unknown_types"].append(("policy", policy.get("Name"), policy.get("PolicyType")))
+        apps = policy["Applications"]
+        orig_total = policy_count(policy, orig_counts)
         new_apps, refs_changed = rewrite_group_refs(apps, split_groups)
-        chunks = even_split_entries(new_apps, ag_counts, limit)
-        if len(chunks) > 1:
-            pieces = [make_piece(policy, i, c) for i, c in enumerate(chunks, start=1)]
+        costs = [get_import_count(a, ag_counts) for a in new_apps]
+        bounds = contiguous_balanced_split(costs, limit)
+        if len(bounds) > 1:
+            pieces = [make_policy_piece(policy, i, new_apps[s:e], ids)
+                      for i, (s, e) in enumerate(bounds, start=1)]
             out_policies.extend(pieces)
             report["policies_split"].append({
                 "name": policy.get("Name", "Unnamed"),
                 "count": orig_total,
                 "pieces": [(p["Name"], policy_count(p, ag_counts)) for p in pieces],
-                "had_links": bool(policy.get("LinkedAgentPolicies")),
             })
         elif refs_changed:
-            piece = make_piece(policy, 1, new_apps)
+            piece = make_policy_piece(policy, 1, new_apps, ids)
             out_policies.append(piece)
             report["policies_associated"].append({
                 "name": policy.get("Name", "Unnamed"),
                 "count": policy_count(piece, ag_counts),
                 "new_name": piece["Name"],
-                "had_links": bool(policy.get("LinkedAgentPolicies")),
             })
 
     # 3. Existing groups the output policies still reference.
@@ -218,18 +292,29 @@ def process_epmp(data, limit=DEFAULT_LIMIT, include_referenced_groups=False):
     referenced = []
     for p in out_policies:
         for a in p.get("Applications") or []:
-            n = a.get("applicationType") == GROUP_REF_TYPE and a.get("displayName")
-            if n and n not in new_group_names and n not in referenced:
-                referenced.append(n)
-    report["referenced_groups"] = [n for n in referenced if n in groups_by_name]
-    report["missing_groups"] = [n for n in referenced if n not in groups_by_name]
+            if a.get("applicationType") != GROUP_REF_TYPE:
+                continue
+            g = groups_by_id.get(str(a.get("id", "")).lower()) or groups_by_name.get(a.get("displayName"))
+            name = g.get("Name") if g else a.get("displayName")
+            if name in new_group_names or name in referenced:
+                continue
+            referenced.append(name)
+            (report["referenced_groups"] if g else report["missing_groups"]).append(name)
     if include_referenced_groups:
         for n in report["referenced_groups"]:
             out_groups.append(copy.deepcopy(groups_by_name[n]))
             report["included_groups"].append(n)
 
-    # 4. Checks.
-    existing_names = {g.get("Name") for g in groups} | {p.get("Name") for p in policies}
+    # 4. Other places (e.g. PARENT_PROCESS patterns) that point at a split group's Id.
+    if split_group_ids:
+        for obj in [p for p in policies if isinstance(p, dict)] + groups:
+            for path, _ in find_strings(obj, split_group_ids):
+                if not (path.startswith("Applications[") and path.endswith("].id")) and path != "Id":
+                    report["stale_group_refs"].append((obj.get("Name", "Unnamed"), path))
+
+    # 5. Checks.
+    existing_names = {g.get("Name") for g in groups} | \
+        {p.get("Name") for p in policies if isinstance(p, dict)}
     for obj in out_groups + out_policies:
         if obj["Name"] in existing_names and obj["Name"] not in report["included_groups"]:
             report["name_collisions"].append(obj["Name"])
@@ -239,24 +324,24 @@ def process_epmp(data, limit=DEFAULT_LIMIT, include_referenced_groups=False):
         if c > limit:
             report["over_limit"].append((p["Name"], c))
 
-    # 5. Output document: same top-level keys; other list sections emptied.
+    # 6. Output: same top-level keys. EndUserUIs keeps only dialogs the output
+    #    policies reference (null stays null); other list sections are emptied.
+    out_text = json.dumps(out_policies).lower()
     out = {}
     for key, value in data.items():
         if key == "AppGroups":
             out[key] = out_groups
         elif key == "Policies":
             out[key] = out_policies
+        elif key == "EndUserUIs" and isinstance(value, list):
+            out[key] = [copy.deepcopy(u) for u in value if isinstance(u, dict) and
+                        isinstance(u.get("id"), str) and u["id"].lower() in out_text]
         elif isinstance(value, list):
             out[key] = []
             if value:
                 report["emptied_sections"].append(key)
         else:
             out[key] = copy.deepcopy(value)
-    if out_groups and "AppGroups" not in out:
-        out["AppGroups"] = out_groups
-    if out_policies and "Policies" not in out:
-        out["Policies"] = out_policies
-
     return out, report
 
 
@@ -265,10 +350,12 @@ def print_report(r, include_referenced_groups):
           f"(groups hold at most {r['limit'] - 1} apps)")
     print(f"Groups split:          {len(r['groups_split'])}")
     for g in r["groups_split"]:
-        print(f"  {g['name']}: {g['count']} apps -> {', '.join(f'{n} ({s})' for n, s in g['pieces'])}")
+        print(f"  {g['name']}: {g['count']} apps -> "
+              + ", ".join(f"{n} ({s})" for n, s in g["pieces"]))
     print(f"Policies split:        {len(r['policies_split'])}")
     for p in r["policies_split"]:
-        print(f"  {p['name']}: {p['count']} defs -> {', '.join(f'{n} ({s})' for n, s in p['pieces'])}")
+        print(f"  {p['name']}: {p['count']} defs -> "
+              + ", ".join(f"{n} ({s})" for n, s in p["pieces"]))
     print(f"Associated policies:   {len(r['policies_associated'])} "
           f"(under the limit, but reference a split group)")
     for p in r["policies_associated"]:
@@ -280,6 +367,14 @@ def print_report(r, include_referenced_groups):
     if r["emptied_sections"]:
         print(f"Other sections left empty in output: {', '.join(r['emptied_sections'])}")
 
+    if r["skipped_policies"]:
+        print(f"\nSkipped policies (not split, not in output): {len(r['skipped_policies'])}")
+        for n, why in r["skipped_policies"]:
+            print(f"  {n}: {why}")
+    if r["unknown_types"]:
+        print("\nWARNING: unknown PolicyType values (processed anyway):")
+        for kind, n, t in r["unknown_types"]:
+            print(f"  {kind} {n}: PolicyType {t}")
     if r["referenced_groups"]:
         verb = "INCLUDED in the output (--include-referenced-groups)" if include_referenced_groups \
             else "NOT in the output; they must already exist in the tenant"
@@ -290,16 +385,14 @@ def print_report(r, include_referenced_groups):
         print("\nWARNING: output policies reference groups not found in the input file:")
         for n in r["missing_groups"]:
             print(f"  {n}")
+    if r["stale_group_refs"]:
+        print("\nWARNING: these fields still point at the Id of a group that was split "
+              "(not rewritten; fix by hand after import):")
+        for n, path in r["stale_group_refs"]:
+            print(f"  {n}: {path}")
     if r["name_collisions"]:
         print("\nWARNING: these new names already exist in the input; rename before import:")
         for n in r["name_collisions"]:
-            print(f"  {n}")
-    linked = [x["name"] for x in r["groups_split"] + r["policies_split"] + r["policies_associated"]
-              if x["had_links"]]
-    if linked:
-        print("\nWARNING: LinkedAgentPolicies is cleared on every new object. These originals had links;")
-        print("re-create the links/assignments on their replacements after import:")
-        for n in linked:
             print(f"  {n}")
 
     print(f"\nVerification:\n  Max definitions in any output policy: {r['max_count']}")
@@ -313,25 +406,23 @@ def print_report(r, include_referenced_groups):
 
 def print_checklist(r):
     print("\nPost-import checklist:")
-    step = 1
-    print(f"  {step}. Import the output file. It adds only new objects (new names and Ids).")
-    step += 1
-    for kind, items in (("policy", r["policies_split"]), ("policy", r["policies_associated"]),
-                        ("AppGroup", r["groups_split"])):
-        for x in items:
-            print(f"  {step}. Delete the original {kind} '{x['name']}' (replaced by the new copies).")
-            step += 1
-    print(f"  {step}. Re-apply links/assignments (computers, users, LinkedAgentPolicies) "
-          f"and policy order/priority on the new policies to match the originals.")
-    step += 1
-    print(f"  {step}. Confirm no policy in the tenant is over {r['limit']} definitions.")
+    lines = ["Import the output file. It adds only new Split_N_ objects (new names and Ids)."]
+    for p in r["policies_split"] + r["policies_associated"]:
+        lines.append(f"Delete the original policy '{p['name']}' (replaced by its Split_N_ copies).")
+    for g in r["groups_split"]:
+        lines.append(f"Delete the original AppGroup '{g['name']}' (replaced by its Split_N_ copies).")
+    lines.append("Check targets/assignments, active state and priority of the Split_N_ policies "
+                 "against the originals before deleting them.")
+    lines.append(f"Confirm no policy in the tenant is over {r['limit']} definitions.")
+    for i, line in enumerate(lines, start=1):
+        print(f"  {i}. {line}")
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Split oversized EPM policies and AppGroups. The output contains only "
-                    "the new split objects (and policies that reference split groups).")
-    parser.add_argument("input", help="Input .epmp file")
+        description="Split oversized EPM policies and AppGroups equally. The output contains "
+                    "only the new Split_N_ objects.")
+    parser.add_argument("input", help="Input .epmp file (an EPM export)")
     parser.add_argument("output", nargs="?", help="Output .epmp file (default: <input>_split.epmp)")
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT,
                         help=f"Max definitions per policy (default {DEFAULT_LIMIT})")
@@ -376,6 +467,8 @@ def main(argv=None):
     print(f"Input AppGroups: {len(data.get('AppGroups') or [])}")
 
     if not report["groups_split"] and not report["policies_split"]:
+        for n, why in report["skipped_policies"]:
+            print(f"  skipped policy {n}: {why}")
         print("\nNothing exceeds the limit. No output written.")
         return EXIT_OK
 
@@ -386,7 +479,7 @@ def main(argv=None):
 
     print(f"\nWriting: {output_path}")
     with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(out, f, indent=2)
+        json.dump(out, f, separators=(",", ":"), ensure_ascii=False)
     print_checklist(report)
     return EXIT_OK
 
