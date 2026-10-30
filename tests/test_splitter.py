@@ -1,6 +1,7 @@
-"""Tests for epm_policy_splitter. All fixtures are synthetic (fake names/Ids)."""
+"""Tests for epm_policy_splitter. All data is synthetic (see tests/synthetic.py)."""
 
 import contextlib
+import copy
 import io
 import json
 import shutil
@@ -9,11 +10,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent))
+sys.path.insert(0, str(HERE))
 import epm_policy_splitter as s  # noqa: E402
+import synthetic as syn  # noqa: E402
 
-FIXTURES = Path(__file__).resolve().parent / "fixtures"
-LIMIT = 10  # small limit so fixtures stay tiny
+FIXTURES = HERE / "fixtures"
+SMALL = 10  # limit used with the small fixtures
 
 
 def load(name):
@@ -32,80 +36,176 @@ def names(objs):
     return [o["Name"] for o in objs]
 
 
-class ProcessTests(unittest.TestCase):
+def counts_after(out, data):
+    """Group sizes as the importer would see them: output groups, else input groups."""
+    sizes = {g["Name"]: len(g["Applications"]) for g in data["AppGroups"]}
+    sizes.update({g["Name"]: len(g["Applications"]) for g in out["AppGroups"]})
+    return sizes
+
+
+def cost(policy, sizes):
+    """Real counting rule: entry = 1, group reference = 1 + apps in the group."""
+    return sum(1 + sizes[a["displayName"]] if a["applicationType"] == 2 else 1
+               for a in policy["Applications"])
+
+
+class SmallFixtureTests(unittest.TestCase):
+    """mixed.epmp with --limit 10."""
+
     def setUp(self):
         self.data = load("mixed.epmp")
-        self.out, self.report = s.process_epmp(self.data, LIMIT)
+        self.out, self.report = s.process_epmp(copy.deepcopy(self.data), SMALL)
 
-    def test_group_over_limit_split_into_new_pieces(self):
-        self.assertEqual(names(self.out["AppGroups"]), ["Fake Group Big_1", "Fake Group Big_2"])
-        sizes = [len(g["Applications"]) for g in self.out["AppGroups"]]
-        self.assertEqual(sizes, [6, 6])
-        self.assertTrue(all(sz <= LIMIT - 1 for sz in sizes))
-        ids = {g["Id"] for g in self.out["AppGroups"]}
-        self.assertNotIn("00000000-0000-4000-8000-000000000001", ids)
-        self.assertTrue(all(g["LinkedAgentPolicies"] == [] for g in self.out["AppGroups"]))
+    def test_group_split_with_prefix_and_balanced(self):
+        self.assertEqual(names(self.out["AppGroups"]),
+                         ["Split_1_Test Group Big", "Split_2_Test Group Big"])
+        self.assertEqual([len(g["Applications"]) for g in self.out["AppGroups"]], [6, 6])
+        for g in self.out["AppGroups"]:
+            self.assertEqual(g["PolicyType"], 14)
+            self.assertEqual(g["LinkedAgentPolicies"], [])
+            self.assertNotEqual(g["Id"], syn.guid(1, 1))
 
-    def test_policy_over_limit_split(self):
-        big = [p for p in self.out["Policies"] if p["Name"].startswith("Fake Policy Big_")]
-        self.assertEqual(len(big), 2)
-        apps = [a for p in big for a in p["Applications"]]
-        self.assertEqual(len(apps), 12)  # nothing lost or duplicated
+    def test_policy_pieces_prefixed_and_order_preserved(self):
+        pieces = [p for p in self.out["Policies"] if p["Name"].endswith("_Test Policy Big")]
+        self.assertEqual(names(pieces), ["Split_1_Test Policy Big", "Split_2_Test Policy Big"])
+        orig = [a["id"] for a in self.data["Policies"][0]["Applications"]]
+        self.assertEqual([a["id"] for p in pieces for a in p["Applications"]], orig)
 
-    def test_untouched_objects_absent(self):
+    def test_mac_policy_split(self):
+        pieces = [p for p in self.out["Policies"] if p["Name"].endswith("_Test Mac Policy Big")]
+        self.assertEqual([len(p["Applications"]) for p in pieces], [6, 6])
+        for p in pieces:
+            self.assertEqual(p["PolicyType"], 13)
+            self.assertEqual(p["LinkedAgentPolicies"][0]["PolicyType"], 1003)
+
+    def test_untouched_and_unsupported_absent(self):
         all_names = names(self.out["Policies"]) + names(self.out["AppGroups"])
-        for n in ("Fake Policy Untouched", "Fake Group Small", "Fake Group Unused",
-                  "Fake Policy Big", "Fake Group Big"):
+        for n in ("Test Policy Untouched", "Test Group Small", "Test Group Unused",
+                  "Test Other Policy No Apps", "Test Policy Big", "Test Group Big"):
             self.assertNotIn(n, all_names)
-        self.assertEqual(self.report["referenced_groups"], ["Fake Group Small"])
+        self.assertEqual(self.report["skipped_policies"],
+                         [("Test Other Policy No Apps", "no Applications key")])
+        self.assertEqual(self.report["referenced_groups"], ["Test Group Small"])
 
-    def test_all_output_policies_within_limit(self):
+    def test_every_output_policy_within_limit(self):
+        sizes = counts_after(self.out, self.data)
+        for p in self.out["Policies"]:
+            self.assertLessEqual(cost(p, sizes), SMALL, p["Name"])
         self.assertEqual(self.report["over_limit"], [])
-        self.assertLessEqual(self.report["max_count"], LIMIT)
 
-    def test_group_refs_carry_piece_ids(self):
+    def test_self_entry(self):
+        orig_types = {p["Name"]: p["LinkedAgentPolicies"][0]["PolicyType"]
+                      for p in self.data["Policies"]}
+        internal = []
+        for p in self.out["Policies"]:
+            (entry,) = p["LinkedAgentPolicies"]
+            self.assertEqual(entry["Id"], p["Id"])
+            original = p["Name"].split("_", 2)[2]
+            self.assertEqual(entry["PolicyType"], orig_types[original])
+            internal.append(entry["InternalId"])
+        self.assertEqual(len(internal), len(set(internal)))
+        self.assertTrue(all(i >= s.SYNTHETIC_INTERNAL_ID_BASE for i in internal))
+
+    def test_group_refs_point_at_pieces(self):
         piece_ids = {g["Name"]: g["Id"] for g in self.out["AppGroups"]}
         refs = [a for p in self.out["Policies"] for a in p["Applications"]
-                if a.get("applicationType") == 2 and a["displayName"] in piece_ids]
+                if a["applicationType"] == 2 and a["displayName"] in piece_ids]
         self.assertEqual(sorted(a["displayName"] for a in refs), sorted(piece_ids))
         for a in refs:
             self.assertEqual(a["id"], piece_ids[a["displayName"]])
+            self.assertEqual(a["patterns"], {})
 
-    def test_unsplit_group_ref_keeps_original_id(self):
+    def test_unsplit_group_ref_unchanged(self):
         refs = [a for p in self.out["Policies"] for a in p["Applications"]
-                if a.get("displayName") == "Fake Group Small"]
-        self.assertEqual([a["id"] for a in refs], ["00000000-0000-4000-8000-000000000002"])
+                if a.get("displayName") == "Test Group Small"]
+        self.assertEqual([a["id"] for a in refs], [syn.guid(1, 2)])
 
-    def test_new_policy_ids_unique_and_new(self):
-        ids = [p["Id"] for p in self.out["Policies"]]
+    def test_ids_new_and_unique(self):
+        ids = [o["Id"] for o in self.out["Policies"] + self.out["AppGroups"]]
         self.assertEqual(len(ids), len(set(ids)))
-        orig = {p["Id"] for p in self.data["Policies"]}
+        orig = {o["Id"] for o in self.data["Policies"] + self.data["AppGroups"]}
         self.assertFalse(orig & set(ids))
 
-    def test_top_level_keys_preserved_other_lists_emptied(self):
+    def test_top_level_keys_and_null_end_user_uis(self):
         self.assertEqual(list(self.out), list(self.data))
-        self.assertEqual(self.out["FakeHeader"], self.data["FakeHeader"])
-        self.assertEqual(self.out["FakeOtherSection"], [])
+        self.assertIsNone(self.out["EndUserUIs"])
+        self.assertEqual(self.out["TrustSoftwareDistributors"], [])
 
-    def test_input_not_mutated(self):
-        self.assertEqual(self.data, load("mixed.epmp"))
+    def test_all_fields_preserved_on_pieces(self):
+        orig = {p["Name"]: p for p in self.data["Policies"]}
+        for p in self.out["Policies"]:
+            self.assertEqual(set(p), set(orig[p["Name"].split("_", 2)[2]]))
 
     def test_include_referenced_groups(self):
-        out, report = s.process_epmp(load("mixed.epmp"), LIMIT, include_referenced_groups=True)
-        self.assertIn("Fake Group Small", names(out["AppGroups"]))
-        self.assertNotIn("Fake Group Unused", names(out["AppGroups"]))
+        out, report = s.process_epmp(load("mixed.epmp"), SMALL, include_referenced_groups=True)
+        self.assertIn("Test Group Small", names(out["AppGroups"]))
+        self.assertNotIn("Test Group Unused", names(out["AppGroups"]))
         self.assertEqual(report["name_collisions"], [])
 
-    def test_reference_own_id_kept_on_first_piece(self):
-        data = load("mixed.epmp")
-        ref = data["Policies"][1]["Applications"][0]
-        ref["id"] = "ref-own-id"  # not the group's Id
-        out, _ = s.process_epmp(data, LIMIT)
-        refs = [a for p in out["Policies"] for a in p["Applications"]
-                if a.get("displayName", "").startswith("Fake Group Big_")]
-        by_name = {a["displayName"]: a["id"] for a in refs}
-        self.assertEqual(by_name["Fake Group Big_1"], "ref-own-id")
-        self.assertNotEqual(by_name["Fake Group Big_2"], "ref-own-id")
+
+class RealSizeTests(unittest.TestCase):
+    """The examples/ input: 1,200-app group and 1,000-entry policies, default limit."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.data = syn.oversized_example()
+        cls.out, cls.report = s.process_epmp(copy.deepcopy(cls.data))
+
+    def test_group_split_equally(self):
+        self.assertEqual([(g["Name"], len(g["Applications"])) for g in self.out["AppGroups"]],
+                         [("Split_1_Test Group Big", 600), ("Split_2_Test Group Big", 600)])
+
+    def test_policies_split_equally(self):
+        sizes = counts_after(self.out, self.data)
+        got = {p["Name"]: cost(p, sizes) for p in self.out["Policies"]}
+        self.assertEqual(got, {
+            "Split_1_Test Policy Uses Big Group": 601, "Split_2_Test Policy Uses Big Group": 603,
+            "Split_1_Test Policy Big": 500, "Split_2_Test Policy Big": 500,
+            "Split_1_Test Mac Policy Big": 500, "Split_2_Test Mac Policy Big": 500,
+        })
+        self.assertTrue(all(c <= 900 for c in got.values()))
+
+    def test_untouched_absent(self):
+        self.assertNotIn("Test Policy Small", names(self.out["Policies"]))
+        self.assertNotIn("Test Group Small", names(self.out["AppGroups"]))
+
+    def test_name_collision_warning(self):
+        data = syn.oversized_example()
+        data["Policies"].append(syn.win_policy(9, "Split_1_Test Policy Big", 1, [], 90000009))
+        _, report = s.process_epmp(data)
+        self.assertIn("Split_1_Test Policy Big", report["name_collisions"])
+
+    def test_unknown_policy_type_warned(self):
+        data = syn.oversized_example()
+        data["Policies"][3]["PolicyType"] = 77
+        _, report = s.process_epmp(data)
+        self.assertIn(("policy", "Test Policy Small", 77), report["unknown_types"])
+
+    def test_stale_parent_process_reference_warned(self):
+        data = syn.oversized_example()
+        app = data["Policies"][2]["Applications"][0]
+        app["patterns"]["PARENT_PROCESS"] = {"@type": "ParentProcess", "AllAncestors": True,
+                                             "ApplicationGroupId": syn.guid(1, 1),
+                                             "ApplicationGroupName": "Test Group Big",
+                                             "isEmpty": False}
+        _, report = s.process_epmp(data)
+        self.assertEqual(len(report["stale_group_refs"]), 1)
+
+
+class SplitAlgorithmTests(unittest.TestCase):
+    def test_balanced_unit_costs(self):
+        for total in (901, 1000, 1801, 2700, 2701):
+            bounds = s.contiguous_balanced_split([1] * total, 900)
+            sizes = [e - st for st, e in bounds]
+            self.assertEqual(len(sizes), -(-total // 900))
+            self.assertLessEqual(max(sizes) - min(sizes), 1)
+            self.assertEqual(sum(sizes), total)
+
+    def test_heavy_entries_never_exceed(self):
+        costs = [600, 1, 1, 600, 1, 300, 300]
+        bounds = s.contiguous_balanced_split(costs, 900)
+        self.assertTrue(all(sum(costs[a:b]) <= 900 for a, b in bounds))
+        self.assertEqual(bounds[-1][1], len(costs))
 
 
 class CliTests(unittest.TestCase):
@@ -115,20 +215,23 @@ class CliTests(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp)
 
-    def test_bom_input(self):
+    def test_bom_input_and_compact_output(self):
         bom = self.tmp / "bom.epmp"
         bom.write_bytes(b"\xef\xbb\xbf" + (FIXTURES / "mixed.epmp").read_bytes())
-        code, log = run([bom, self.tmp / "o.epmp", "--limit", LIMIT])
+        out = self.tmp / "o.epmp"
+        code, log = run([bom, out, "--limit", SMALL])
         self.assertEqual(code, 0, log)
-        self.assertTrue((self.tmp / "o.epmp").exists())
+        text = out.read_text(encoding="utf-8")
+        self.assertNotIn(", ", text[:200])
+        self.assertIn('"EndUserUIs":null', text)
 
     def test_refuses_existing_output(self):
         out = self.tmp / "o.epmp"
         out.write_text("keep me")
-        code, _ = run([FIXTURES / "mixed.epmp", out, "--limit", LIMIT])
+        code, _ = run([FIXTURES / "mixed.epmp", out, "--limit", SMALL])
         self.assertEqual(code, 2)
         self.assertEqual(out.read_text(), "keep me")
-        code, _ = run([FIXTURES / "mixed.epmp", out, "--limit", LIMIT, "--force"])
+        code, _ = run([FIXTURES / "mixed.epmp", out, "--limit", SMALL, "--force"])
         self.assertEqual(code, 0)
         self.assertIn("Policies", json.loads(out.read_text()))
 
@@ -136,27 +239,23 @@ class CliTests(unittest.TestCase):
         inp = self.tmp / "in.epmp"
         shutil.copy(FIXTURES / "mixed.epmp", inp)
         before = inp.read_text()
-        code, _ = run([inp, inp, "--limit", LIMIT])
+        code, _ = run([inp, inp, "--limit", SMALL])
         self.assertEqual(code, 2)
         self.assertEqual(inp.read_text(), before)
 
     def test_nothing_to_split_writes_nothing(self):
         out = self.tmp / "o.epmp"
-        code, log = run([FIXTURES / "nothing_to_split.epmp", out, "--limit", LIMIT])
+        code, log = run([FIXTURES / "nothing_to_split.epmp", out, "--limit", SMALL])
         self.assertEqual(code, 0)
         self.assertFalse(out.exists())
         self.assertIn("No output written", log)
 
     def test_over_limit_exits_1_without_writing(self):
-        data = load("mixed.epmp")
-        # Force an unsplittable result: every entry alone costs more than the limit.
         orig = s.get_import_count
-        s.get_import_count = lambda a, c: LIMIT + 5
+        s.get_import_count = lambda a, c: SMALL + 5  # every entry alone is over the limit
         try:
-            inp = self.tmp / "in.epmp"
-            inp.write_text(json.dumps(data))
             out = self.tmp / "o.epmp"
-            code, log = run([inp, out, "--limit", LIMIT])
+            code, log = run([FIXTURES / "mixed.epmp", out, "--limit", SMALL])
         finally:
             s.get_import_count = orig
         self.assertEqual(code, 1, log)
@@ -169,11 +268,18 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 2)
 
     def test_summary_has_checklist(self):
-        code, log = run([FIXTURES / "mixed.epmp", self.tmp / "o.epmp", "--limit", LIMIT])
+        code, log = run([FIXTURES / "mixed.epmp", self.tmp / "o.epmp", "--limit", SMALL])
         self.assertEqual(code, 0)
         self.assertIn("Post-import checklist", log)
-        self.assertIn("Delete the original AppGroup 'Fake Group Big'", log)
-        self.assertIn("LinkedAgentPolicies", log)
+        self.assertIn("Delete the original AppGroup 'Test Group Big'", log)
+        self.assertIn("Delete the original policy 'Test Mac Policy Big'", log)
+        self.assertIn("Skipped policies", log)
+
+    def test_example_files_match_generator(self):
+        ex = HERE.parent / "examples" / "test_oversized_input.epmp"
+        if not ex.exists():
+            self.skipTest("examples not generated")
+        self.assertEqual(json.loads(ex.read_text(encoding="utf-8")), syn.oversized_example())
 
 
 if __name__ == "__main__":
