@@ -47,6 +47,14 @@ ids = [o["Id"] for o in out["Policies"] + out["AppGroups"]]
 check(len(ids) == len(set(ids)) and not set(ids) & orig_ids, "all Ids new and unique")
 internal = [p["LinkedAgentPolicies"][0]["InternalId"] for p in out["Policies"]]
 check(len(internal) == len(set(internal)), "InternalIds unique")
+pieces = [(g["Id"], g["Name"]) for g in out["AppGroups"]]
+(pp_policy,) = [p for p in out["Policies"] if p["Name"].endswith("_Test Policy Parent Process")]
+targets = [(a["patterns"]["PARENT_PROCESS"]["ApplicationGroupId"],
+            a["patterns"]["PARENT_PROCESS"]["ApplicationGroupName"])
+           for a in pp_policy["Applications"] if "PARENT_PROCESS" in a["patterns"]]
+check(targets == pieces * 3, "Test Policy Parent Process: each PARENT_PROCESS entry "
+      "cloned once per Test Group Big piece, in order")
+check(not any(i in json.dumps(out) for i in orig_ids), "no original Id left in the output")
 for name in ("Test Policy Uses Big Group", "Test Policy Big", "Test Mac Policy Big"):
     src_ids = [a["id"] for a in orig[name]["Applications"] if a["applicationType"] != 2]
     got = [a["id"] for p in out["Policies"] if p["Name"].endswith("_" + name)
