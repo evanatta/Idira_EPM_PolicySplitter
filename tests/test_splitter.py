@@ -116,7 +116,9 @@ class CliTests(unittest.TestCase):
         shutil.rmtree(self.tmp)
 
     def test_bom_input(self):
-        code, log = run([FIXTURES / "bom.epmp", self.tmp / "o.epmp", "--limit", LIMIT])
+        bom = self.tmp / "bom.epmp"
+        bom.write_bytes(b"\xef\xbb\xbf" + (FIXTURES / "mixed.epmp").read_bytes())
+        code, log = run([bom, self.tmp / "o.epmp", "--limit", LIMIT])
         self.assertEqual(code, 0, log)
         self.assertTrue((self.tmp / "o.epmp").exists())
 
