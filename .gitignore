@@ -1,4 +1,29 @@
+# Python
 __pycache__/
-*.pyc
-*_split.epmp
-!examples/*_split.epmp
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editors and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# EPM exports and script output. Real exports never belong in this repo.
+# Only the synthetic examples under examples/ are committed.
+*.epmp
+!examples/test_oversized_input.epmp
+!examples/test_oversized_input_split.epmp
+!tests/fixtures/*.epmp
